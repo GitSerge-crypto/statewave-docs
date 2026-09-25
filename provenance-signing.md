@@ -1,5 +1,9 @@
 # Provenance source signing
 
+> **Status:** draft RFC, not implemented. This page specifies an opt-in
+> convention only — no Ed25519 verification, trust table, or
+> `verification` field exists in Statewave core yet.
+
 Statewave's provenance records *where a memory came from*. This page defines
 an **opt-in convention** that upgrades one specific claim inside that
 provenance from *asserted* to *verifiable*: "this content was authored by the
@@ -44,33 +48,46 @@ Memories are **derived** at compile time — a source system never authors
 one, so a source can never sign one. The signable object is the
 **episode**: the raw record the source actually handed over.
 
-The canonical string covers exactly the fields the source is in a position
-to attest — its own identity, its own record key, the claimed time, and the
-content:
+The JCS (RFC 8785) canonicalization of the signed episode covers exactly
+the fields the source is in a position to attest:
 
-```
-canon = "statewave:ep:"
-        + subject_id + ":"
-        + idempotency_key + ":"
-        + occurred_at_epoch_seconds + ":"
-        + sha256_hex(RFC 8785 (payload))
-signature = Ed25519.sign(source_private_key, canon_bytes)
+```json
+signed = {
+  "v": 1,
+  "subject_id": "...",
+  "idempotency_key": "...",
+  "occurred_at": "2026-09-24T12:00:00Z",
+  "source": "...",
+  "key_id": "src:acme-crm:2026-09",
+  "alg": "Ed25519",
+  "payload": { ...episode payload as supplied... }
+}
+signature = Ed25519.sign(source_private_key, JCS(signed))
 ```
 
-- `idempotency_key` is the source's own record id (the same key that makes
-  ingest idempotent). It is what the source can guarantee across retries —
-  a regenerated episode UUID cannot.
-- `occurred_at` stays **inside** canon: binding the claimed time into the
-  signature is the point. Ingest-time tampering with `occurred_at` breaks
-  the signature.
-- Canonicalization is **RFC 8785 (JSON Canonicalization Scheme)** over the
-  episode `payload` — sorted keys, no whitespace, UTF-8, named by its RFC
-  so implementers don't have to guess.
+- The canon is the RFC 8785 (JCS) canonicalization of the entire
+  `signed` object — sorted keys, no whitespace, UTF-8. A colon-joined
+  string would be delimiter-ambiguous (`repo:acme` + `widgets:doc1` is
+  byte-for-byte equal to `repo:acme:widgets` + `doc1`, so a signature
+  could lift from one subject onto another); object canonicalization
+  removes the ambiguity because fields live in JSON structure, not in a
+  concatenation.
+- The signature covers `source`, `key_id`, and `alg` as well: a trusted
+  key must not be able to sign a payload that is later shown under a
+  different `source`, and the read path can surface the verifying
+  `key_id`.
+- `idempotency_key` is the source's own record id (the same key that
+  makes ingest idempotent). It is what the source can guarantee across
+  retries — a regenerated episode UUID cannot.
+- `occurred_at` is a timezone-aware RFC 3339 UTC string and stays inside
+  the signed object: binding the claimed time into the signature is the
+  point, so ingest-time tampering with `occurred_at` breaks the
+  signature. Naive timestamps are not signable — `occurred_at` is
+  optional on ingest (it defaults to `now()`), but a signed episode
+  carries its own aware value.
 - Episodes without an `idempotency_key` cannot carry a meaningful source
-  signature (the source would be signing an object it can't re-identify);
-  such episodes are simply never signed and report `unknown_key` for the
-  structural reason that there is nothing to verify — distinct from an
-  `unverified` episode whose signature exists but fails.
+  signature (the source would be signing an object it cannot
+  re-identify); such episodes are simply never signed.
 
 ## Where the signature lives
 
@@ -94,9 +111,7 @@ episode.provenance.signature = {
 ## Key distribution, rotation, and verification
 
 **Trust table.** The operator configures, per connector, which `key_id`s
-are trusted and their public keys — the same configuration surface and
-mental model as webhooks / webhook secrets today. Statewave never sees
-private keys.
+are trusted and their public keys. Statewave never sees private keys.
 
 **Rotation.** Add the new `key_id` to the trust table, keep the old one
 valid for a configurable grace window, then prune. No revocation list in
@@ -114,18 +129,17 @@ consequences, both deliberate:
   operator currently trusts.
 
 **Read path.** Read responses gain an optional `verification` field per
-episode and per memory: `verified | unverified | unknown_key`.
+episode and per memory: `verified | unverified | unsigned`.
 
 - `verified` — a signature present, algorithm accepted, `key_id` in the
-  trust table, signature valid over the canon recomputed from stored
-  bytes.
+  trust table, signature valid over the JCS canonicalization recomputed
+  from stored bytes.
 - `unverified` — a signature present but failing any of the above
   (mismatched bytes, unknown-algorithm, pruned key).
-- `unknown_key` — no signature was ever supplied (the field is absent),
-  or the `key_id` has never appeared in the trust table.
-
-Nothing is persisted; consumers that don't request verification see
-today's behavior.
+- `unsigned` — no signature was ever supplied (the field is absent).
+  A separate bucket: deployments that have not adopted signing report
+  `unsigned` (neutral), NOT `unverified` (which means a signature
+  failed).
 
 ## Propagation to derived memories
 
@@ -136,10 +150,9 @@ memory already carries.
 The propagation rule, stated once and applied mechanically:
 
 > A memory reports `verified` if and only if **every** episode listed in
-> its `source_episode_ids` verifies. Any `unverified` or `unknown_key`
-> episode in the set makes the memory `unverified`; absent
-> `source_episode_ids` (orphaned or hand-authored memories) makes the
-> memory `unknown_key`.
+> its `source_episode_ids` verifies. Any `unverified` episode in the set
+> makes the memory `unverified`; absent `source_episode_ids` (orphaned or
+> hand-authored memories) makes the memory `unsigned`.
 
 The three statuses stay exactly as defined above; this rule only decides
 how a memory derives its own status from the episodes it was compiled
